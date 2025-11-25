@@ -53,13 +53,49 @@ class EvaluationMetrics:
             # Get top-k features
             top_features = contributions[:top_k]
             
-            # Sum contributions as proxy for prediction
-            total_contribution = sum(c.get('contribution', c.get('shap_value', 0)) 
-                                    for c in top_features)
-            base_value = explanation.get('base_value', 0.0)
+            # Extract contribution values (handle both 'contribution' and 'shap_value' keys)
+            contribution_values = []
+            for c in top_features:
+                contrib_val = c.get('contribution', c.get('shap_value', 0))
+                if contrib_val != 0:  # Only include non-zero contributions
+                    contribution_values.append(contrib_val)
             
-            # Reconstructed probability (simplified)
-            reconstructed_prob = 1.0 / (1.0 + np.exp(-(base_value + total_contribution)))
+            if not contribution_values:
+                continue
+            
+            # Sum contributions
+            total_contribution = sum(contribution_values)
+            
+            # Get base value (SHAP has it, LIME doesn't)
+            base_value = explanation.get('base_value', None)
+            method = explanation.get('method', '').lower()
+            
+            # Reconstruct prediction based on explanation type
+            if 'shap' in method and base_value is not None:
+                # SHAP: contributions are additive to base value
+                # For binary classification, use sigmoid transformation
+                logit = base_value + total_contribution
+                reconstructed_prob = 1.0 / (1.0 + np.exp(-logit))
+            else:
+                # LIME: contributions are already in probability/logit space
+                # Use the prediction from explanation if available
+                pred_from_exp = explanation.get('prediction', None)
+                if pred_from_exp is not None:
+                    if isinstance(pred_from_exp, list):
+                        # For binary classification, use positive class probability
+                        if len(pred_from_exp) > 1:
+                            reconstructed_prob = float(pred_from_exp[1])
+                        else:
+                            reconstructed_prob = float(pred_from_exp[0])
+                    else:
+                        reconstructed_prob = float(pred_from_exp)
+                else:
+                    # Fallback: use contributions as logit and apply sigmoid
+                    # Estimate base from mean of contributions (rough approximation)
+                    estimated_base = -np.mean(contribution_values) if contribution_values else 0.0
+                    logit = estimated_base + total_contribution
+                    reconstructed_prob = 1.0 / (1.0 + np.exp(-np.clip(logit, -10, 10)))
+            
             reconstructed_scores.append(reconstructed_prob)
             valid_indices.append(i)
         
@@ -96,7 +132,7 @@ class EvaluationMetrics:
         reconstructed_scores = np.array(reconstructed_scores[:min_len])
         actual_probs = np.array(actual_probs[:min_len])
         
-        # Compute correlation and MSE
+        # Compute correlation and normalized MSE
         if len(reconstructed_scores) < 2:
             # Need at least 2 points for correlation
             correlation = 0.0
@@ -107,8 +143,21 @@ class EvaluationMetrics:
                 correlation = 0.0
             mse = np.mean((reconstructed_scores - actual_probs) ** 2)
         
-        # Fidelity score (higher is better)
-        fidelity_score = max(0.0, correlation * (1.0 - mse))
+        # Normalize MSE to [0, 1] range (assuming probabilities are in [0, 1])
+        # Maximum possible MSE for probabilities is 1.0 (when predictions are completely wrong)
+        normalized_mse = min(1.0, mse)
+        
+        # Fidelity score: combination of correlation and accuracy
+        # Use both correlation (rank ordering) and 1 - normalized_mse (accuracy)
+        # Weight them equally
+        if correlation > 0:
+            fidelity_score = 0.5 * correlation + 0.5 * (1.0 - normalized_mse)
+        else:
+            # If correlation is negative or zero, rely mainly on MSE
+            fidelity_score = max(0.0, 1.0 - normalized_mse)
+        
+        # Ensure score is in [0, 1]
+        fidelity_score = np.clip(fidelity_score, 0.0, 1.0)
         
         return {
             'fidelity_score': float(fidelity_score),
@@ -332,6 +381,28 @@ class EvaluationMetrics:
             'num_ratings': len(trust_scores)
         }
     
+    def _normalize_feature_name(self, feature_name: str) -> str:
+        """
+        Normalize feature name for comparison (remove parentheses, extra spaces, etc.).
+        
+        Args:
+            feature_name: Feature name string
+            
+        Returns:
+            Normalized feature name
+        """
+        if not isinstance(feature_name, str):
+            return str(feature_name)
+        
+        # Remove content in parentheses (e.g., "Feature_0 (0.5)" -> "Feature_0")
+        if '(' in feature_name:
+            feature_name = feature_name.split('(')[0].strip()
+        
+        # Remove extra whitespace
+        feature_name = feature_name.strip()
+        
+        return feature_name
+    
     def _explanation_similarity(
         self,
         exp1: Dict[str, Any],
@@ -347,28 +418,80 @@ class EvaluationMetrics:
         Returns:
             Similarity score (0-1)
         """
-        contrib1 = {c.get('feature'): c.get('contribution', c.get('shap_value', 0))
-                   for c in exp1.get('contributions', [])}
-        contrib2 = {c.get('feature'): c.get('contribution', c.get('shap_value', 0))
-                   for c in exp2.get('contributions', [])}
+        # Extract contributions with normalized feature names
+        contrib1 = {}
+        for c in exp1.get('contributions', []):
+            feat = c.get('feature', '')
+            if feat:
+                feat_normalized = self._normalize_feature_name(feat)
+                contrib_val = c.get('contribution', c.get('shap_value', 0))
+                # Use maximum absolute value if feature appears multiple times
+                if feat_normalized in contrib1:
+                    if abs(contrib_val) > abs(contrib1[feat_normalized]):
+                        contrib1[feat_normalized] = contrib_val
+                else:
+                    contrib1[feat_normalized] = contrib_val
+        
+        contrib2 = {}
+        for c in exp2.get('contributions', []):
+            feat = c.get('feature', '')
+            if feat:
+                feat_normalized = self._normalize_feature_name(feat)
+                contrib_val = c.get('contribution', c.get('shap_value', 0))
+                # Use maximum absolute value if feature appears multiple times
+                if feat_normalized in contrib2:
+                    if abs(contrib_val) > abs(contrib2[feat_normalized]):
+                        contrib2[feat_normalized] = contrib_val
+                else:
+                    contrib2[feat_normalized] = contrib_val
         
         if len(contrib1) == 0 or len(contrib2) == 0:
             return 0.0
         
-        # Common features
-        common_features = set(contrib1.keys()).intersection(set(contrib2.keys()))
+        # Get all unique features from both explanations
+        all_features = set(contrib1.keys()).union(set(contrib2.keys()))
         
-        if len(common_features) == 0:
+        if len(all_features) == 0:
             return 0.0
         
-        # Compare contributions
-        similarities = []
-        for feat in common_features:
-            val1 = contrib1[feat]
-            val2 = contrib2[feat]
-            if abs(val1) + abs(val2) > 0:
-                sim = 1.0 - abs(val1 - val2) / (abs(val1) + abs(val2) + 1e-6)
-                similarities.append(max(0.0, sim))
+        # Create vectors for cosine similarity
+        vec1 = np.array([contrib1.get(f, 0.0) for f in all_features])
+        vec2 = np.array([contrib2.get(f, 0.0) for f in all_features])
         
-        return np.mean(similarities) if similarities else 0.0
+        # Compute cosine similarity
+        dot_product = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        cosine_sim = dot_product / (norm1 * norm2)
+        
+        # Also compute rank correlation for top features
+        # Get top features by absolute value
+        top_k = min(10, len(contrib1), len(contrib2))
+        top_features1 = sorted(contrib1.items(), key=lambda x: abs(x[1]), reverse=True)[:top_k]
+        top_features2 = sorted(contrib2.items(), key=lambda x: abs(x[1]), reverse=True)[:top_k]
+        
+        # Create feature rankings
+        rank1 = {feat: idx for idx, (feat, _) in enumerate(top_features1)}
+        rank2 = {feat: idx for idx, (feat, _) in enumerate(top_features2)}
+        
+        # Compute rank similarity for common top features
+        common_top = set(rank1.keys()).intersection(set(rank2.keys()))
+        if len(common_top) > 0:
+            rank_diffs = [abs(rank1[f] - rank2[f]) for f in common_top]
+            max_rank_diff = max(len(rank1), len(rank2)) - 1
+            rank_sim = 1.0 - np.mean(rank_diffs) / max_rank_diff if max_rank_diff > 0 else 1.0
+            rank_sim = max(0.0, rank_sim)
+        else:
+            rank_sim = 0.0
+        
+        # Combine cosine similarity and rank similarity
+        # Weight cosine similarity more (0.7) as it captures magnitude
+        combined_sim = 0.7 * cosine_sim + 0.3 * rank_sim
+        
+        # Ensure result is in [0, 1]
+        return float(np.clip(combined_sim, 0.0, 1.0))
 
